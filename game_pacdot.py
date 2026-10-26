@@ -9,12 +9,15 @@ import pygame
 import hand_control_opencv as hc
 
 # ================= Konfigurasi =================
-CELL = 42                      # ukuran 1 petak labirin (px) -- naikkan/turunkan buat window lebih besar/kecil
+CELL = 42                      # ukuran satu petak labirin, px
 FPS = 30
-MOVE_EVERY_MS = 170            # kecepatan auto-move karakter (makin kecil makin cepat)
-ENEMY_MOVE_EVERY_MS = 260      # musuh gerak lebih lambat dari player (biar fair)
+MOVE_EVERY_MS = 170            # kecepatan auto-move player
+ENEMY_MOVE_EVERY_MS = 260      # musuh sengaja dibikin lebih lambat biar fair
 LIVES_START = 3
-CAM_PREVIEW_W = 380            # lebar preview kamera kecil di pojok game (diperbesar biar kelihatan jelas)
+COIN_FRAME_MS = 110            # kecepatan animasi koin
+
+CAM_PREVIEW_W = 280
+MASK_PREVIEW_W = 280
 
 ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
@@ -26,7 +29,7 @@ COLOR_PLAYER = (255, 235, 70)
 COLOR_ENEMY = (235, 60, 60)
 COLOR_TEXT = (240, 240, 240)
 
-# '#'=dinding, '.'=jalan+dot, ' '=jalan kosong, 'P'=start player, 'E'=start enemy
+# '#' dinding, '.' jalan (ada dot), ' ' jalan kosong, 'P' start player, 'E' start enemy
 MAZE_LAYOUT = [
     "###############",
     "#P............#",
@@ -50,21 +53,40 @@ DIR_VECTORS = {
 }
 
 
-# ================= Aset (opsional) =================
+# ================= Aset =================
 def load_image(filename, size):
-    """Coba load gambar dari folder assets/. Kalau tidak ada -> None (fallback bentuk warna)."""
+    """Load gambar dari assets/, balikin None kalau nggak ada (nanti dipakai fallback warna polos)."""
     path = os.path.join(ASSET_DIR, filename)
     if os.path.isfile(path):
         try:
             img = pygame.image.load(path).convert_alpha()
             return pygame.transform.smoothscale(img, size)
         except Exception as e:
-            print(f"[WARNING] Gagal memuat assets/{filename}: {e}")
+            print(f"[WARNING] Gagal load assets/{filename}: {e}")
     return None
 
 
+def load_coin_frames(size):
+    """Load coin_01.png, coin_02.png, dst sampai nomornya nggak ketemu lagi. Kalau kosong, coba dot.png."""
+    frames = []
+    i = 1
+    while True:
+        frame = load_image(f"coin_{i:02d}.png", size)
+        if frame is None:
+            break
+        frames.append(frame)
+        i += 1
+
+    if not frames:
+        single = load_image("dot.png", size)
+        if single:
+            frames = [single]
+
+    return frames
+
+
 def cv2_frame_to_surface(frame_bgr):
-    """Konversi frame OpenCV (BGR) jadi pygame.Surface untuk ditampilkan di jendela game."""
+    """Konversi frame OpenCV (BGR) ke pygame.Surface."""
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     return pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
 
@@ -95,11 +117,7 @@ class Maze:
         return self.grid[row][col] == "#"
 
     def _reachable_dots(self):
-        """
-        BFS dari posisi start player -> hanya sel yang BENAR-BENAR bisa
-        dicapai yang dijadikan dot. Ini menjamin game selalu bisa dimenangkan
-        (dot tidak pernah ditaruh di kantong labirin yang tidak terjangkau).
-        """
+        """BFS dari start player, cuma sel yang beneran kejangkau yang dikasih dot - jadi game selalu bisa menang."""
         from collections import deque as _dq
 
         visited = set()
@@ -152,15 +170,13 @@ class Player(Entity):
         self.next_direction = None
 
     def update(self, maze: Maze, hand_command, now_ms):
-        # Perintah tangan (kalau ada) jadi niat arah berikutnya
         if hand_command is not None:
             self.next_direction = hand_command
 
-        # Coba belok ke next_direction dulu (kalau jalannya terbuka)
+        # coba belok dulu kalau jalannya kebuka, kalau nggak bisa ya lanjut lurus (auto-move)
         if self.next_direction is not None:
             if self.try_move(maze, self.next_direction, now_ms, MOVE_EVERY_MS):
                 return
-        # Kalau tidak bisa belok, lanjut jalan ke arah sekarang (auto-move)
         self.try_move(maze, self.direction, now_ms, MOVE_EVERY_MS)
 
 
@@ -175,7 +191,7 @@ class Enemy(Entity):
         if not options:
             return
 
-        # Lebih suka lanjut arah sekarang atau belok, hindari balik arah kalau masih ada opsi lain
+        # lebih suka lanjut/belok, hindari langsung balik arah kalau masih ada opsi lain
         non_reverse = [d for d in options if d != opposite.get(self.direction)]
         pick_from = non_reverse if non_reverse else options
 
@@ -193,21 +209,23 @@ class Game:
 
         self.maze = Maze(MAZE_LAYOUT)
         maze_w, maze_h = self.maze.pixel_size()
-        self.hud_h = 90
+        self.hud_h = 112
         self.cam_h = int(CAM_PREVIEW_W * hc.CAM_HEIGHT / hc.CAM_WIDTH)
+        self.preview_label_h = 24
 
-        self.screen_w = max(maze_w, CAM_PREVIEW_W + 20)
-        self.screen_h = maze_h + self.hud_h + self.cam_h + 20
+        self.screen_w = max(maze_w, CAM_PREVIEW_W + MASK_PREVIEW_W + 30)
+        self.screen_h = maze_h + self.hud_h + self.cam_h + self.preview_label_h + 20
         self.screen = pygame.display.set_mode((self.screen_w, self.screen_h))
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("consolas", 22)
+        self.font_small = pygame.font.SysFont("consolas", 17)
         self.font_big = pygame.font.SysFont("consolas", 34, bold=True)
 
         self.player_img = load_image("player.png", (CELL, CELL))
         self.enemy_img = load_image("enemy.png", (CELL, CELL))
-        self.dot_img = load_image("dot.png", (CELL // 2, CELL // 2))
         self.wall_img = load_image("wall.png", (CELL, CELL))
         self.bg_img = load_image("bg.png", (maze_w, maze_h))
+        self.coin_frames = load_coin_frames((int(CELL * 0.7), int(CELL * 0.7)))
 
         self.cap = hc.open_camera(0)
         self.reset()
@@ -221,10 +239,9 @@ class Game:
         self.score = 0
         self.lives = LIVES_START
         self.state = "WAIT_CALIBRATION" if not hc.calibrated else "PLAYING"
-        self.message = None
 
-    # -------- Render labirin --------
-    def draw_maze(self, surf):
+    # -------- Render --------
+    def draw_maze(self, surf, now_ms):
         ox, oy = 0, self.hud_h
         if self.bg_img:
             surf.blit(self.bg_img, (ox, oy))
@@ -241,15 +258,19 @@ class Game:
                         pygame.draw.rect(surf, COLOR_WALL, (x, y, CELL, CELL))
                         pygame.draw.rect(surf, (20, 35, 90), (x, y, CELL, CELL), 1)
 
+        # koin animasi - frame-nya gantian terus berdasarkan waktu, loop otomatis
+        coin_frame = None
+        if self.coin_frames:
+            idx = (now_ms // COIN_FRAME_MS) % len(self.coin_frames)
+            coin_frame = self.coin_frames[idx]
+
         for (c, r) in self.maze.dots:
             x, y = ox + c * CELL + CELL // 2, oy + r * CELL + CELL // 2
-            if self.dot_img:
-                rect = self.dot_img.get_rect(center=(x, y))
-                surf.blit(self.dot_img, rect)
+            if coin_frame:
+                surf.blit(coin_frame, coin_frame.get_rect(center=(x, y)))
             else:
                 pygame.draw.circle(surf, COLOR_DOT, (x, y), max(CELL // 8, 3))
 
-        # Enemy
         ex, ey = self.enemy.pos_px()
         ex, ey = ox + ex, oy + ey
         if self.enemy_img:
@@ -257,7 +278,6 @@ class Game:
         else:
             pygame.draw.circle(surf, COLOR_ENEMY, (ex + CELL // 2, ey + CELL // 2), CELL // 2 - 2)
 
-        # Player
         px_, py_ = self.player.pos_px()
         px_, py_ = ox + px_, oy + py_
         if self.player_img:
@@ -283,16 +303,27 @@ class Game:
         surf.blit(orient_txt, (14, 64))
 
         if self.state == "WAIT_CALIBRATION":
-            info = self.font.render("Taruh telapak di ZONA TANGAN (preview kamera) lalu tekan 'c'", True, (255, 220, 80))
-            surf.blit(info, (320, 10))
+            info = self.font_small.render(
+                "-> Taruh telapak di kotak ZONA TANGAN (preview bawah), lalu tekan C",
+                True, (255, 220, 80))
+            surf.blit(info, (14, 90))
 
-    def draw_camera_preview(self, surf, frame_display):
-        preview = cv2.resize(frame_display, (CAM_PREVIEW_W, self.cam_h))
-        preview_surf = cv2_frame_to_surface(preview)
-        px = self.screen_w - CAM_PREVIEW_W - 10
+    def draw_camera_preview(self, surf, frame_display, mask):
         py = self.screen_h - self.cam_h - 10
-        surf.blit(preview_surf, (px, py))
+
+        px = self.screen_w - CAM_PREVIEW_W - 10
+        preview = cv2.resize(frame_display, (CAM_PREVIEW_W, self.cam_h))
+        surf.blit(cv2_frame_to_surface(preview), (px, py))
         pygame.draw.rect(surf, (90, 90, 110), (px - 2, py - 2, CAM_PREVIEW_W + 4, self.cam_h + 4), 2)
+        surf.blit(self.font_small.render("Kamera", True, (180, 180, 180)), (px, py - self.preview_label_h))
+
+        mx = px - MASK_PREVIEW_W - 10
+        if mask is not None:
+            mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            mask_resized = cv2.resize(mask_bgr, (MASK_PREVIEW_W, self.cam_h))
+            surf.blit(cv2_frame_to_surface(mask_resized), (mx, py))
+        pygame.draw.rect(surf, (90, 90, 110), (mx - 2, py - 2, MASK_PREVIEW_W + 4, self.cam_h + 4), 2)
+        surf.blit(self.font_small.render("Mask Kulit", True, (180, 180, 180)), (mx, py - self.preview_label_h))
 
     def draw_center_message(self, surf, text, color):
         txt = self.font_big.render(text, True, color)
@@ -304,7 +335,7 @@ class Game:
 
     # -------- Loop utama --------
     def run(self):
-        print("[INFO] Tekan 'c' untuk kalibrasi warna kulit, panah untuk kontrol manual, 'r' restart, ESC keluar.")
+        print("[INFO] c = kalibrasi kulit, p/b = kalibrasi orientasi, panah = kontrol manual, r = restart, ESC = keluar.")
         running = True
         while running:
             now_ms = pygame.time.get_ticks()
@@ -315,9 +346,8 @@ class Game:
                 frame = cv2.flip(frame, 1)
                 frame_display = frame.copy()
                 hand_result = hc.detect_hand(frame)
-                # show_text=False: preview-nya bakal diperkecil, teks detail
-                # biarin tampil di HUD resolusi penuh di atas saja supaya
-                # tetap terbaca (bukan ikut mengecil dan jadi tidak jelas).
+                # show_text=False soalnya preview ini bakal diperkecil - teks
+                # detailnya cukup tampil di HUD resolusi penuh di atas
                 hc.draw_debug_overlay(frame_display, hand_result, show_text=False)
             else:
                 frame_display = np.zeros((hc.CAM_HEIGHT, hc.CAM_WIDTH, 3), dtype=np.uint8)
@@ -374,11 +404,11 @@ class Game:
                 if not self.maze.dots:
                     self.state = "WIN"
 
-            # ---- Gambar ----
             self.screen.fill(COLOR_BG)
             self.draw_hud(self.screen, hand_result)
-            self.draw_maze(self.screen)
-            self.draw_camera_preview(self.screen, frame_display)
+            self.draw_maze(self.screen, now_ms)
+            mask_for_preview = hand_result["mask"] if hand_result is not None else None
+            self.draw_camera_preview(self.screen, frame_display, mask_for_preview)
 
             if self.state == "WAIT_CALIBRATION":
                 self.draw_center_message(self.screen, "KALIBRASI DULU (tekan C)", (255, 210, 60))
